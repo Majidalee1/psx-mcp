@@ -87,6 +87,18 @@ async def _get(client: httpx.AsyncClient, path: str) -> str:
     return r.text
 
 
+async def _post(client: httpx.AsyncClient, path: str, data: dict) -> str:
+    r = await client.post(
+        f"{BASE}{path}" if path.startswith("/") else path,
+        data=data,
+        headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
+        timeout=TIMEOUT,
+        follow_redirects=True,
+    )
+    r.raise_for_status()
+    return r.text
+
+
 def _parse_float(s: str) -> float | None:
     if not s:
         return None
@@ -161,52 +173,60 @@ async def fetch_quote(symbol: str) -> Quote | None:
 # ──────────────────────────── payouts / dividends ────────────────────────────
 
 async def fetch_payouts() -> list[Dividend]:
-    """Scrape the upcoming payouts table."""
-    async with httpx.AsyncClient() as client:
-        html = await _get(client, "/payouts")
-
-    soup = BeautifulSoup(html, "html.parser")
+    """Scrape the upcoming payouts table via POST (PSX SPA endpoint)."""
+    page_size = 100
     out: list[Dividend] = []
 
-    for table in soup.find_all("table"):
-        headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
-        if not headers:
-            continue
+    async with httpx.AsyncClient() as client:
+        offset = 0
+        while True:
+            html = await _post(client, "/payouts", {"count": page_size, "offset": offset})
+            soup = BeautifulSoup(html, "html.parser")
+            table = soup.find("table")
+            if not table:
+                break
 
-        def col(name_part: str, hs: list[str] = headers) -> int:
-            for i, h in enumerate(hs):
-                if name_part in h:
-                    return i
-            return -1
+            rows_found = 0
+            for tr in table.find_all("tr"):
+                cells = tr.find_all("td")
+                if not cells:
+                    continue
+                rows_found += 1
+                symbol = cells[0].get_text(strip=True)
+                company = cells[1].get_text(strip=True) if len(cells) > 1 else ""
+                payout_raw = cells[3].get_text(strip=True) if len(cells) > 3 else ""
+                bc_raw = cells[5].get_text(strip=True) if len(cells) > 5 else ""
 
-        c_sym = col("symbol")
-        c_name = col("company")
-        c_from = col("from")
-        c_to = col("to")
-        c_agm_date = col("agm date")
-        c_agm_time = col("agm time")
-        c_type = col("type")
-        c_payout = col("payout")
+                bc_from, bc_to = "", ""
+                if "-" in bc_raw:
+                    parts = [p.strip() for p in bc_raw.split("-", 1)]
+                    bc_from = parts[0]
+                    bc_to = parts[1] if len(parts) > 1 else ""
 
-        for tr in table.find_all("tr"):
-            cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-            if not cells:
-                continue
-            try:
+                payout_type = ""
+                if "(D)" in payout_raw:
+                    payout_type = "CASH DIVIDEND"
+                elif "(R)" in payout_raw:
+                    payout_type = "RIGHT SHARES"
+                elif "(B)" in payout_raw:
+                    payout_type = "BONUS SHARES"
+
                 out.append(
                     Dividend(
-                        symbol=cells[c_sym] if c_sym >= 0 else cells[0],
-                        company=cells[c_name] if c_name >= 0 else "",
-                        bc_from=cells[c_from] if c_from >= 0 else "",
-                        bc_to=cells[c_to] if c_to >= 0 else "",
-                        agm_date=cells[c_agm_date] if c_agm_date >= 0 else "",
-                        agm_time=cells[c_agm_time] if c_agm_time >= 0 else "",
-                        type=cells[c_type] if c_type >= 0 else "",
-                        payout=cells[c_payout] if c_payout >= 0 else "",
+                        symbol=symbol,
+                        company=company,
+                        bc_from=bc_from,
+                        bc_to=bc_to,
+                        agm_date="",
+                        agm_time="",
+                        type=payout_type,
+                        payout=payout_raw,
                     )
                 )
-            except IndexError:
-                continue
+
+            if rows_found < page_size:
+                break
+            offset += page_size
 
     return [d for d in out if d.symbol]
 
