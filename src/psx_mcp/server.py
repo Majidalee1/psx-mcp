@@ -19,10 +19,28 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 
 from mcp.server.fastmcp import FastMCP
 
 from . import dividend_calc, scraper
+
+PAR_VALUE = 10.0
+
+
+def _parse_payout(raw: str) -> dict:
+    """Convert PSX payout string to human-readable values."""
+    m = re.search(r"(\d+(?:\.\d+)?)\s*%", raw)
+    if not m:
+        return {"payout_raw": raw}
+    pct = float(m.group(1))
+    rs_per_share = round(pct / 100 * PAR_VALUE, 2)
+    return {
+        "payout_raw": raw,
+        "payout_pct": pct,
+        "dividend_per_share": rs_per_share,
+        "payout_description": f"Rs {rs_per_share}/share ({pct}% of Rs {PAR_VALUE:.0f} par)",
+    }
 
 mcp = FastMCP("psx-mcp")
 
@@ -86,11 +104,9 @@ async def get_upcoming_dividends(symbol: str | None = None) -> list[dict]:
             "symbol": p.symbol,
             "company": p.company,
             "type": p.type,
-            "payout": p.payout,
+            **_parse_payout(p.payout),
             "book_closure_from": p.bc_from,
             "book_closure_to": p.bc_to,
-            "agm_date": p.agm_date,
-            "agm_time": p.agm_time,
             "buy_deadline": status.get("buy_deadline"),
             "days_to_buy_deadline": status.get("days_to_buy_deadline"),
             "status": status.get("status"),
@@ -127,7 +143,7 @@ async def get_buy_deadline(symbol: str) -> dict:
     return {
         "symbol": p.symbol,
         "company": p.company,
-        "payout": p.payout,
+        **_parse_payout(p.payout),
         "type": p.type,
         "book_closure_from": p.bc_from,
         **status,
@@ -148,7 +164,7 @@ async def get_dividend_history(symbol: str, years: int = 5) -> list[dict]:
         {
             "symbol": d.symbol,
             "type": d.type,
-            "payout": d.payout,
+            **_parse_payout(d.payout),
             "book_closure_from": d.bc_from,
             "book_closure_to": d.bc_to,
         }
@@ -233,15 +249,12 @@ async def screen_dividend_stocks(min_payout_pct: float = 0.0, limit: int = 25) -
     (yield = dividend / current price). For real yield you'd cross-reference
     each symbol's current price — call get_quote() per symbol if needed.
     """
-    import re
     payouts = await scraper.fetch_payouts()
     filtered = []
     for p in payouts:
-        m = re.search(r"(\d+(?:\.\d+)?)\s*%", p.payout)
-        if not m:
-            continue
-        pct = float(m.group(1))
-        if pct < min_payout_pct:
+        parsed = _parse_payout(p.payout)
+        pct = parsed.get("payout_pct")
+        if pct is None or pct < min_payout_pct:
             continue
         status = dividend_calc.classify_dividend(p.bc_from)
         if status.get("status") == "PASSED":
@@ -249,8 +262,7 @@ async def screen_dividend_stocks(min_payout_pct: float = 0.0, limit: int = 25) -
         filtered.append({
             "symbol": p.symbol,
             "company": p.company,
-            "payout": p.payout,
-            "payout_pct": pct,
+            **parsed,
             "type": p.type,
             "book_closure_from": p.bc_from,
             "buy_deadline": status.get("buy_deadline"),
@@ -292,7 +304,7 @@ async def resource_upcoming_dividends() -> str:
         out.append({
             "symbol": p.symbol,
             "company": p.company,
-            "payout": p.payout,
+            **_parse_payout(p.payout),
             "type": p.type,
             "bc_from": p.bc_from,
             "buy_deadline": status.get("buy_deadline"),
