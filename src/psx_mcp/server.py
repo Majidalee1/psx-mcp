@@ -80,6 +80,8 @@ async def get_upcoming_dividends(symbol: str | None = None) -> list[dict]:
     out = []
     for p in payouts:
         status = dividend_calc.classify_dividend(p.bc_from)
+        if status.get("status") == "PASSED":
+            continue
         out.append({
             "symbol": p.symbol,
             "company": p.company,
@@ -108,15 +110,20 @@ async def get_buy_deadline(symbol: str) -> dict:
     """
     sym = symbol.upper()
     payouts = await scraper.fetch_payouts()
-    matches = [p for p in payouts if p.symbol.upper() == sym]
+    matches = []
+    for p in payouts:
+        if p.symbol.upper() != sym:
+            continue
+        s = dividend_calc.classify_dividend(p.bc_from)
+        if s.get("status") != "PASSED":
+            matches.append((p, s))
     if not matches:
         return {
             "symbol": sym,
             "status": "NO_UPCOMING_DIVIDEND",
             "message": f"{sym} has no upcoming dividend in the PSX payouts table.",
         }
-    p = matches[0]
-    status = dividend_calc.classify_dividend(p.bc_from)
+    p, status = matches[0]
     return {
         "symbol": p.symbol,
         "company": p.company,
@@ -226,11 +233,10 @@ async def screen_dividend_stocks(min_payout_pct: float = 0.0, limit: int = 25) -
     (yield = dividend / current price). For real yield you'd cross-reference
     each symbol's current price — call get_quote() per symbol if needed.
     """
+    import re
     payouts = await scraper.fetch_payouts()
     filtered = []
     for p in payouts:
-        # Try to extract a numeric % from the payout string
-        import re
         m = re.search(r"(\d+(?:\.\d+)?)\s*%", p.payout)
         if not m:
             continue
@@ -238,6 +244,8 @@ async def screen_dividend_stocks(min_payout_pct: float = 0.0, limit: int = 25) -
         if pct < min_payout_pct:
             continue
         status = dividend_calc.classify_dividend(p.bc_from)
+        if status.get("status") == "PASSED":
+            continue
         filtered.append({
             "symbol": p.symbol,
             "company": p.company,
@@ -279,6 +287,8 @@ async def resource_upcoming_dividends() -> str:
     out = []
     for p in payouts:
         status = dividend_calc.classify_dividend(p.bc_from)
+        if status.get("status") == "PASSED":
+            continue
         out.append({
             "symbol": p.symbol,
             "company": p.company,
