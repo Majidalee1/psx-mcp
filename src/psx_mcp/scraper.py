@@ -127,33 +127,36 @@ async def fetch_quote(symbol: str) -> Quote | None:
 
         soup = BeautifulSoup(html, "html.parser")
 
-        # The company page renders fields in a left-summary block. Selectors are
-        # resilient to small DOM changes — we look for label text and grab siblings.
-        def field(label_pattern: str) -> str:
-            label = soup.find(string=re.compile(label_pattern, re.I))
-            if not label:
-                return ""
-            parent = label.parent
-            if not parent:
-                return ""
-            # Try sibling
-            sib = parent.find_next_sibling()
-            if sib and sib.get_text(strip=True):
-                return sib.get_text(strip=True)
-            # Try next text
-            return (parent.get_text(strip=True) or "").replace(label.strip(), "").strip()
+        name_el = soup.find("div", class_="quote__name")
+        if name_el:
+            for child in name_el.find_all("div"):
+                child.decompose()
+            name = name_el.get_text(strip=True)
+        else:
+            og = soup.find("meta", property="og:title")
+            name = og["content"].split(" - ")[0].replace(symbol, "").strip(" -") if og else symbol
 
-        name_el = soup.find("h2") or soup.find("h1")
-        name = name_el.get_text(strip=True) if name_el else symbol
+        close_el = soup.find("div", class_="quote__close")
+        last = _parse_float(close_el.get_text(strip=True).replace("Rs.", "")) if close_el else None
 
-        last = _parse_float(field(r"^last\b|current price|ldcp"))
-        change = _parse_float(field(r"^change\b"))
-        change_pct = _parse_float(field(r"change\s*%|pct"))
-        volume = _parse_int(field(r"volume"))
-        high = _parse_float(field(r"^high\b"))
-        low = _parse_float(field(r"^low\b"))
-        open_ = _parse_float(field(r"^open\b"))
-        prev_close = _parse_float(field(r"prev|previous"))
+        change_el = soup.find("div", class_="quote__change")
+        change_text = change_el.get_text(" ", strip=True) if change_el else ""
+        change_match = re.search(r"(-?[\d,.]+)\s+\((-?[\d,.]+)%\)", change_text)
+        change = _parse_float(change_match.group(1)) if change_match else None
+        change_pct = _parse_float(change_match.group(2)) if change_match else None
+
+        def stat(label: str) -> str:
+            el = soup.find("div", class_="stats_label", string=re.compile(f"^{label}$", re.I))
+            if not el:
+                return ""
+            val = el.find_next_sibling("div", class_="stats_value")
+            return val.get_text(strip=True) if val else ""
+
+        volume = _parse_int(stat("Volume"))
+        high = _parse_float(stat("High"))
+        low = _parse_float(stat("Low"))
+        open_ = _parse_float(stat("Open"))
+        prev_close = _parse_float(stat("LDCP")) or _parse_float(stat("Previous Close"))
 
         return Quote(
             symbol=symbol,
@@ -233,79 +236,112 @@ async def fetch_payouts() -> list[Dividend]:
 
 async def fetch_dividend_history(symbol: str, years: int = 5) -> list[Dividend]:
     """
-    Fetch historical dividends for a symbol.
-    PSX exposes per-company payout history on the company page.
+    Fetch historical dividends for a symbol via POST to /company/payouts.
     """
     symbol = symbol.upper().strip()
+    cutoff = datetime.now() - timedelta(days=365 * years)
+    out: list[Dividend] = []
+
     async with httpx.AsyncClient() as client:
         try:
-            html = await _get(client, f"/company/{symbol}")
+            html = await _post(client, "/company/payouts", {"symbol": symbol})
         except httpx.HTTPError:
             return []
 
     soup = BeautifulSoup(html, "html.parser")
-    out: list[Dividend] = []
-    cutoff = datetime.now() - timedelta(days=365 * years)
+    table = soup.find("table")
+    if not table:
+        return []
 
-    # Find the payout-history table (usually labeled "Payouts" or "Dividend History")
-    for table in soup.find_all("table"):
-        headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
-        if not headers or not any("payout" in h or "dividend" in h for h in headers):
+    for tr in table.find_all("tr"):
+        cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+        if len(cells) < 3:
             continue
-        for tr in table.find_all("tr"):
-            cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-            if len(cells) < 2:
-                continue
-            # Expect columns roughly: Year | Type | Payout | BC From | BC To
-            try:
-                year_str = cells[0]
-                year_match = re.search(r"\d{4}", year_str)
-                if year_match and int(year_match.group()) < cutoff.year:
-                    continue
-                out.append(
-                    Dividend(
-                        symbol=symbol,
-                        company="",
-                        bc_from=cells[3] if len(cells) > 3 else "",
-                        bc_to=cells[4] if len(cells) > 4 else "",
-                        agm_date="",
-                        agm_time="",
-                        type=cells[1] if len(cells) > 1 else "",
-                        payout=cells[2] if len(cells) > 2 else cells[-1],
-                    )
-                )
-            except (IndexError, ValueError):
-                continue
+        date_str = cells[0]
+        year_match = re.search(r"\d{4}", date_str)
+        if year_match and int(year_match.group()) < cutoff.year:
+            continue
+
+        payout_raw = cells[2] if len(cells) > 2 else ""
+        bc_raw = cells[3] if len(cells) > 3 else ""
+
+        bc_from, bc_to = "", ""
+        if "-" in bc_raw:
+            parts = [p.strip() for p in bc_raw.split("-", 1)]
+            bc_from = parts[0]
+            bc_to = parts[1] if len(parts) > 1 else ""
+
+        payout_type = ""
+        if "(D)" in payout_raw:
+            payout_type = "CASH DIVIDEND"
+        elif "(R)" in payout_raw:
+            payout_type = "RIGHT SHARES"
+        elif "(B)" in payout_raw:
+            payout_type = "BONUS SHARES"
+
+        out.append(
+            Dividend(
+                symbol=symbol,
+                company="",
+                bc_from=bc_from,
+                bc_to=bc_to,
+                agm_date="",
+                agm_time="",
+                type=payout_type,
+                payout=payout_raw,
+            )
+        )
     return out
 
 
 # ──────────────────────────── announcements ────────────────────────────
 
 async def fetch_announcements(symbol: str | None = None, limit: int = 20) -> list[Announcement]:
-    """Fetch recent company announcements, optionally filtered by symbol."""
-    async with httpx.AsyncClient() as client:
-        html = await _get(client, "/announcements/companies")
-
-    soup = BeautifulSoup(html, "html.parser")
+    """Fetch recent company announcements via POST."""
+    limit = max(1, min(limit, 100))
     out: list[Announcement] = []
 
-    for table in soup.find_all("table"):
-        for tr in table.find_all("tr"):
-            cells = tr.find_all("td")
-            if len(cells) < 3:
-                continue
-            date = cells[0].get_text(strip=True)
-            sym = cells[1].get_text(strip=True).upper()
-            title = cells[2].get_text(strip=True)
-            link_el = tr.find("a", href=True)
-            pdf = link_el["href"] if link_el else None
-            if pdf and pdf.startswith("/"):
-                pdf = BASE + pdf
-            if symbol and sym != symbol.upper():
-                continue
-            out.append(Announcement(date=date, symbol=sym, title=title, pdf_url=pdf))
-            if len(out) >= limit:
-                return out
+    async with httpx.AsyncClient() as client:
+        data = {
+            "type": "C",
+            "symbol": symbol.upper() if symbol else "",
+            "query": "",
+            "count": limit,
+            "offset": 0,
+            "date_from": "",
+            "date_to": "",
+            "page": "annc",
+        }
+        try:
+            html = await _post(client, "/announcements", data)
+        except httpx.HTTPError:
+            return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
+    if not table:
+        return []
+
+    for tr in table.find_all("tr"):
+        cells = tr.find_all("td")
+        if len(cells) < 5:
+            continue
+        date_str = cells[0].get_text(strip=True)
+        time_str = cells[1].get_text(strip=True)
+        sym = cells[2].get_text(strip=True).upper()
+        title = cells[4].get_text(strip=True)
+        link_el = tr.find("a", href=re.compile(r"\.(pdf|gif)$", re.I))
+        pdf = link_el["href"] if link_el else None
+        if pdf and pdf.startswith("/"):
+            pdf = BASE + pdf
+
+        out.append(Announcement(
+            date=f"{date_str} {time_str}",
+            symbol=sym,
+            title=title,
+            pdf_url=pdf,
+        ))
+
     return out
 
 
@@ -359,11 +395,11 @@ async def fetch_all_symbols() -> dict[str, str]:
 
     soup = BeautifulSoup(html, "html.parser")
     mapping: dict[str, str] = {}
-    for table in soup.find_all("table"):
-        for tr in table.find_all("tr"):
-            cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-            if len(cells) >= 2 and cells[0] and cells[0].isupper():
-                mapping[cells[0]] = cells[1]
+    for link in soup.find_all("a", class_="tbl__symbol", href=True):
+        title = link.get("data-title", "")
+        sym = link.get_text(strip=True)
+        if sym:
+            mapping[sym] = title or sym
 
     _SYMBOL_CACHE = mapping
     _CACHE_AT = datetime.now()
